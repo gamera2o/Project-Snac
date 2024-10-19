@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WebRTC Demo</title>
+    <style>
+      video {
+        width: 300px;
+        height: auto;
+        border: 1px solid black;
+      }
+    </style>
+    <!-- Firebase App (the core Firebase SDK) -->
+    <script src="https://www.gstatic.com/firebasejs/9.22.1/firebase-app-compat.js"></script>
+    <!-- Firebase Firestore -->
+    <script src="https://www.gstatic.com/firebasejs/9.22.1/firebase-firestore-compat.js"></script>
+  </head>
+  <body>
+    <h2>1. Start your Webcam</h2>
+    <div class="videos">
+      <span>
+        <h3>Local Stream</h3>
+        <video id="webcamVideo" autoplay playsinline></video>
+      </span>
+      <span>
+        <h3>Remote Stream</h3>
+        <video id="remoteVideo" autoplay playsinline></video>
+      </span>
+    </div>
+
+    <button id="webcamButton">Start webcam</button>
+    <h2>2. Create a new Call</h2>
+    <button id="callButton" disabled>Create Call (offer)</button>
+
+    <h2>3. Join a Call</h2>
+    <p>Answer the call from a different browser window or device</p>
+    <input id="callInput" />
+    <button id="answerButton" disabled>Answer</button>
+
+    <h2>4. Hangup</h2>
+    <button id="hangupButton" disabled>Hangup</button>
+
+    <script type="module">
+      // Your Firebase config
+      const firebaseConfig = {
+        apiKey: "AIzaSyCytcll_PrQsBm_D4DaAR9lTFUgfdXlNaI",
+        authDomain: "project-snac.firebaseapp.com",
+        projectId: "project-snac",
+        storageBucket: "project-snac.appspot.com",
+        messagingSenderId: "313245671786",
+        appId: "1:313245671786:web:bda0319f141f667cbf8513",
+        measurementId: "G-NM7WEVJV92",
+      };
+      
+      // Initialize Firebase
+      firebase.initializeApp(firebaseConfig);
+      const firestore = firebase.firestore();
+
+      const servers = {
+        iceServers: [
+          {
+            urls: [
+              "stun:stun1.l.google.com:19302",
+              "stun:stun2.l.google.com:19302",
+            ],
+          },
+        ],
+        iceCandidatePoolSize: 10,
+      };
+
+      // Global State
+      const pc = new RTCPeerConnection(servers);
+      let localStream = null;
+      let remoteStream = null;
+
+      // HTML elements
+      const webcamButton = document.getElementById("webcamButton");
+      const webcamVideo = document.getElementById("webcamVideo");
+      const callButton = document.getElementById("callButton");
+      const callInput = document.getElementById("callInput");
+      const answerButton = document.getElementById("answerButton");
+      const remoteVideo = document.getElementById("remoteVideo");
+      const hangupButton = document.getElementById("hangupButton");
+
+      // 1. Setup media sources
+      webcamButton.onclick = async () => {
+        try {
+          localStream = await navigator.mediaDevices.getUserMedia({
+            video: true,
+            audio: true,
+          });
+          remoteStream = new MediaStream();
+
+          // Push tracks from local stream to peer connection
+          localStream.getTracks().forEach((track) => {
+            pc.addTrack(track, localStream);
+          });
+
+          // Pull tracks from remote stream, add to video stream
+          pc.ontrack = (event) => {
+            event.streams[0].getTracks().forEach((track) => {
+              remoteStream.addTrack(track);
+            });
+          };
+
+          webcamVideo.srcObject = localStream;
+          remoteVideo.srcObject = remoteStream;
+
+          callButton.disabled = false;
+          answerButton.disabled = false;
+          webcamButton.disabled = true;
+        } catch (error) {
+          console.error("Error accessing media devices.", error);
+          alert("Error accessing camera or microphone: " + error.message);
+        }
+      };
+
+      // 2. Create an offer
+      callButton.onclick = async () => {
+        const callDoc = firestore.collection("calls").doc();
+        const offerCandidates = callDoc.collection("offerCandidates");
+        const answerCandidates = callDoc.collection("answerCandidates");
+
+        callInput.value = callDoc.id;
+
+        pc.onicecandidate = (event) => {
+          if (event.candidate) {
+            offerCandidates.add(event.candidate.toJSON());
+          }
+        };
+
+        const offerDescription = await pc.createOffer();
+        await pc.setLocalDescription(offerDescription);
+
+        const offer = {
+          sdp: offerDescription.sdp,
+          type: offerDescription.type,
+        };
+
+        await callDoc.set({ offer });
+
+        callDoc.onSnapshot((snapshot) => {
+          const data = snapshot.data();
+          if (!pc.currentRemoteDescription && data?.answer) {
+            const answerDescription = new RTCSessionDescription(data.answer);
+            pc.setRemoteDescription(answerDescription);
+          }
+        });
+
+        answerCandidates.onSnapshot((snapshot) => {
+          snapshot.docChanges().forEach((change) => {
+            if (change.type === "added") {
+              const candidate = new RTCIceCandidate(change.doc.data());
+              pc.addIceCandidate(candidate);
+            }
+          });
+        });
+
+        hangupButton.disabled = false;
+      };
+
+      // 3. Answer the call with the unique ID
+      answerButton.onclick = async () => {
+        const callId = callInput.value;
+        const callDoc = firestore.collection("calls").doc(callId);
+        const answerCandidates = callDoc.collection("answerCandidates");
+        const offerCandidates = callDoc.collection("offerCandidates");
+
+        pc.onicecandidate = (event) => {
+          if (event.candidate) {
+            answerCandidates.add(event.candidate.toJSON());
+          }
+        };
+
+        const callData = (await callDoc.get()).data();
+
+        const offerDescription = callData.offer;
+        await pc.setRemoteDescription(
+          new RTCSessionDescription(offerDescription)
+        );
+
+        const answerDescription = await pc.createAnswer();
+        await pc.setLocalDescription(answerDescription);
+
+        const answer = {
+          type: answerDescription.type,
+          sdp: answerDescription.sdp,
+        };
+
+        await callDoc.update({ answer });
+
+        offerCandidates.onSnapshot((snapshot) => {
+          snapshot.docChanges().forEach((change) => {
+            if (change.type === "added") {
+              const candidate = new RTCIceCandidate(change.doc.data());
+              pc.addIceCandidate(candidate);
+            }
+          });
+        });
+      };
+
+      // Optional: Hang up the call
+      hangupButton.onclick = () => {
+        pc.close();
+        localStream.getTracks().forEach((track) => track.stop());
+        webcamButton.disabled = false;
+        callButton.disabled = true;
+        answerButton.disabled = true;
+        hangupButton.disabled = true;
+      };
+    </script>
+  </body>
+</html>
